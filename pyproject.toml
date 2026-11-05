@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p2p"
+version = "0.1.0"
+description = "Find which layers of a model to run in parallel, and how to shrink their replicas, given steps and replica size."
+requires-python = ">=3.11"
+dependencies = ["sglang==0.5.23"]
+
+[project.scripts]
+p2p = "p2p.cli:main"
+
+[project.entry-points."sglang.srt.plugins"]
+p2p = "p2p.plugin:install"
+
+[tool.setuptools]
+packages = ["p2p"]
