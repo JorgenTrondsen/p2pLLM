@@ -38,6 +38,26 @@ def test_the_search_finds_the_scans_plan():
     assert [list(s) for s in segments] == data["segments"]
 
 
+def test_layers_of_one_class_with_other_shapes_are_other_kinds():
+    sliding = {"q": [8192, 5376], "k": [4096, 5376], "v": [4096, 5376], "o": [5376, 8192]} | dict.fromkeys(("gate", "up"), [21504, 5376])
+    sliding["down"] = [5376, 21504]
+    full = {**sliding, "q": [16384, 5376], "k": [2048, 5376], "v": [2048, 5376], "o": [5376, 16384]}
+    layers = [{"type": "Gemma4DecoderLayer", "proj": p} for p in (sliding, sliding, full, sliding, full)]
+    types = search.kinds(layers)
+    assert types[0] == types[1] == types[3] != types[2] == types[4]
+    for shape in (sliding, full):
+        assert all(search.size(shape, keep) <= 0.40 for keep in search.splits(shape, 0.40).values())
+
+
+def test_routed_experts_take_the_cut():
+    shape = {"q": [2048, 2048], "k": [2048, 2048], "v": [4096, 2048], "z": [4096, 2048], "out": [2048, 4096], "gate": [512, 2048],
+             "up": [512, 2048], "down": [2048, 512], "egate": [131072, 2048], "eup": [131072, 2048], "edown": [524288, 512]}
+    recipes = search.splits(shape, 0.40)
+    assert set(recipes) == {"uniform", "rest50", "rest70", "rest90"}
+    assert all(search.size(shape, keep) <= 0.40 for keep in recipes.values())
+    assert recipes["rest90"]["q"] == 90 and recipes["rest90"]["eup"] < recipes["rest50"]["eup"]
+
+
 def _brute_force(L: int, options: dict) -> dict:
     """{steps: least summed cost} over every split of L layers into singles, pairs and triples."""
     best = {}

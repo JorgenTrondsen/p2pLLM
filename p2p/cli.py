@@ -24,7 +24,7 @@ def main(argv=None) -> int:
 
     def scored(s):
         common(s)
-        s.add_argument("--n", type=int, default=32, help="problems KL is measured on")
+        s.add_argument("--n", type=int, default=64, help="problems KL is measured on")
         s.add_argument("--max-sol", type=int, default=256, help="solution tokens scored per problem")
         s.add_argument("--min-sol", type=int, default=0, help="only problems with this many solution tokens")
         s.add_argument("--solutions", default="", help="existing solutions, a glob of JSONL with id and ids")

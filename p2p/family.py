@@ -1,6 +1,7 @@
 """What we need to know about a model family: its layers, projections and linear-attention state.
 
 To support a family with other projection names, add them to TABLE. Row blocks come from each module's output_sizes.
+Routed MoE experts live in one module with one tensor per kind of projection, so they are projections too (_routed_experts).
 """
 from __future__ import annotations
 
@@ -15,8 +16,14 @@ TABLE = {"qkv_proj": ("q", "k", "v"), "in_proj_qkvz": ("q", "k", "v", "z"), "o_p
 
 class Projection(NamedTuple):
     path: str                # the module inside its layer
-    rows: slice              # its rows of that module's weight, on this rank
+    rows: "slice | tuple"    # where it is in that module's tensor, on this rank
     shape: list              # [rows, cols] over all ranks
+    param: str = "weight"    # that module's tensor
+
+    @property
+    def key(self) -> str:
+        """What its calibration sums are stored under."""
+        return self.path if self.param == "weight" else f"{self.path}.{self.param}"
 
 
 def layers(model: nn.Module) -> nn.ModuleList:
@@ -39,14 +46,45 @@ def projections(layer: nn.Module) -> dict:
             for name, total, rows in zip(names, getattr(m, "output_sizes", None) or [m.output_size], local, strict=True):
                 out[name] = Projection(path, slice(start, start + rows), [total, m.input_size])
                 start += rows
+        elif hasattr(m, "w13_weight"):
+            out |= _routed_experts(path, m)
     if not {"gate", "up", "down"} <= set(out) or not {"q", "k", "v"} <= set(out):
         raise ValueError(f"{type(layer).__name__}: add its attention and MLP projections to p2p.family.TABLE")
+    _check_covered(layer, out)
     return out
 
 
-def is_row_parallel(module: nn.Module) -> bool:
-    """Whether each rank holds only some columns of this projection's rows."""
-    return module.weight.shape[1] != module.input_size
+def _check_covered(layer: nn.Module, projected: dict) -> None:
+    """Stop if a large part of the layer isn't among the projections: replica sizes would look far smaller than they are."""
+    modules = dict(layer.named_modules())
+    known = {id(w) for p in projected.values() for w in modules[p.path].parameters()}
+    counted = sum(rows * cols for rows, cols in (p.shape for p in projected.values()))
+    other = sum(w.numel() for w in layer.parameters() if id(w) not in known)
+    if counted < 0.9 * (counted + other):
+        raise ValueError(f"{type(layer).__name__}: only {100 * counted / (counted + other):.0f}% of its weights are in "
+                         "p2p.family.TABLE, so replica sizes would be wrong")
+
+
+def _routed_experts(path: str, m: nn.Module) -> dict:
+    """A FusedMoE's experts: w13_weight [expert, 2 * rows, hidden] holds gate then up, w2_weight [expert, hidden, rows] holds down."""
+    config = m.moe_runner_config
+    if m.use_triton_kernels or not config.is_gated or config.activation != "silu" or m.num_local_experts != m.num_experts:
+        raise ValueError(f"{path}: p2p handles gated SiLU experts in the default layout, all on one rank group")
+    rows, total = m.intermediate_size_per_partition, m.intermediate_size_per_partition * m.moe_tp_size
+    gate_up = [m.num_experts * total, m.hidden_size]
+    return {"egate": Projection(path, (slice(None), slice(0, rows)), gate_up, "w13_weight"),
+            "eup": Projection(path, (slice(None), slice(rows, 2 * rows)), gate_up, "w13_weight"),
+            "edown": Projection(path, (slice(None), slice(None)), [m.num_experts * m.hidden_size, total], "w2_weight")}
+
+
+def split_group(module: nn.Module, p: Projection):
+    """The TP group whose ranks each hold only some of this projection's columns, or None if every rank holds them all."""
+    if getattr(module, p.param).shape[-1] == p.shape[1]:
+        return None
+    if hasattr(module, "tp_group"):
+        return module.tp_group
+    from sglang.srt.runtime_context import get_parallel
+    return get_parallel().tp_group
 
 
 @contextlib.contextmanager

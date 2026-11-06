@@ -5,11 +5,20 @@ A segment (start, n) is n consecutive layers run in one step; its last layer's n
 """
 from __future__ import annotations
 
+import json
 import math
 import statistics
 
 MLP = ("gate", "up", "down")
+ROUTED = ("egate", "eup", "edown")   # a MoE's routed experts
 STATE_KEEP = 7                 # k and v write only the current token's state, so they cost little to tighten
+
+
+def kinds(layers: list) -> list:
+    """A label per layer, shared by layers of the same class and projection shapes. The class alone isn't enough: Gemma 4's
+    full-attention layers have wider heads than its sliding ones. layers: [{"type", "proj"}]."""
+    seen = {}
+    return [seen.setdefault(json.dumps(x, sort_keys=True), f"{x['type']}/{len(seen)}") for x in layers]
 
 
 def size(shape: dict, keep: dict) -> float:
@@ -24,16 +33,21 @@ def size(shape: dict, keep: dict) -> float:
     return bits / (16 * total)
 
 
-def _with_mlp(shape: dict, mixer: dict, cap: float) -> "dict | None":
-    """`mixer` plus the largest whole MLP percentage that fits `cap`."""
-    fits = [y for y in range(1, 100) if size(shape, {**mixer, **dict.fromkeys(MLP, y)}) <= cap]
-    return {**mixer, **dict.fromkeys(MLP, fits[-1])} if fits else None
+def _filled(shape: dict, mixer: dict, cap: float, rest: tuple = MLP) -> "dict | None":
+    """`mixer` plus the largest whole percentage for the `rest` projections that fits `cap`."""
+    fits = [y for y in range(1, 100) if size(shape, {**mixer, **dict.fromkeys(rest, y)}) <= cap]
+    return {**mixer, **dict.fromkeys(rest, fits[-1])} if fits else None
 
 
 def splits(shape: dict, cap: float) -> dict:
     """Ways to split a replica's budget, by name, each at most `cap`: uniform, and k, v tightened in favour of the output
     projection, with q and z moved around that and the MLP taking the rest."""
     x = math.floor(100 * (cap - 1 / 16))
+    if ROUTED[0] in shape:                 # routed experts are nearly the whole layer, so all the rest is cheap to keep
+        others = [n for n in shape if n not in ROUTED]
+        recipes = {"uniform": dict.fromkeys(shape, x)}
+        recipes |= {f"rest{r}": _filled(shape, dict.fromkeys(others, r), cap, ROUTED) for r in (50, 70, 90)}
+        return {k: v for k, v in recipes.items() if v}
     out = "out" if "out" in shape else "o"
     linear = "z" in shape                  # a linear-attention mixer has its own z block and a smaller q
     base = {"k": STATE_KEEP, "v": STATE_KEEP, "q": x // 2 if linear else max(x - 5, 1), out: x + 22, **({"z": x} if linear else {})}
@@ -42,7 +56,7 @@ def splits(shape: dict, cap: float) -> dict:
     recipes = {"uniform": dict.fromkeys(shape, x)}
     for name, move in moves.items():
         mixer = {n: v for n, v in {**base, **move}.items() if n in shape}
-        recipes[name] = _with_mlp(shape, mixer, cap)
+        recipes[name] = _filled(shape, mixer, cap)
     return {k: v for k, v in recipes.items() if v}
 
 

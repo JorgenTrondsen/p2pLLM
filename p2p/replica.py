@@ -37,10 +37,12 @@ def shrink(layer: nn.Module, keep: dict, sums: dict, i: int) -> nn.Module:
     for name, p in family.projections(layer).items():
         if keep[name] < 100:
             module = modules[p.path]
-            w = weights.setdefault(p.path, module.weight.data.clone())
-            w[p.rows] = wanda.prune(w[p.rows], keep[name], wanda.channel_norms(sums[i, p.path], module), module)
-    for path, w in weights.items():
-        modules[path].weight = nn.Parameter(w, requires_grad=False)
+            if (p.path, p.param) not in weights:
+                weights[p.path, p.param] = getattr(module, p.param).data.clone()
+            w, group = weights[p.path, p.param], family.split_group(module, p)
+            w[p.rows] = wanda.prune(w[p.rows], keep[name], wanda.channel_norms(sums[i, p.key], w, group), group)
+    for (path, param), w in weights.items():
+        setattr(modules[path], param, nn.Parameter(w, requires_grad=False))
     return c
 
 

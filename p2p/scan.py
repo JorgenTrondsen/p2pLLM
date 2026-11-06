@@ -69,7 +69,7 @@ def measure(a, arms: list) -> dict:
 def scan(a) -> int:
     _setup(a)
     shapes = {int(i): s for i, s in json.load(open(f"{a.out}/shapes.json")).items()}
-    types = [shapes[i]["type"] for i in sorted(shapes)]
+    types = search.kinds([shapes[i] for i in sorted(shapes)])
     L, shape_of = len(types), {t: shapes[types.index(t)]["proj"] for t in types}
     recipes = {t: search.splits(shape_of[t], a.replica_size) for t in shape_of}
     reps = search.representatives(types)
