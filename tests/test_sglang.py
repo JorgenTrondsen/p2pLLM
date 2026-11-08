@@ -212,14 +212,16 @@ def plain_stream(monkeypatch):
     monkeypatch.setattr(replica, "residual_batch", SimpleNamespace(set_written=lambda x, fb: x, stream_of=lambda fb: stream))
 
 
-def _batch(decode: bool):
-    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode))
+def _batch(mode: str):
+    return SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: mode == "decode", is_target_verify=lambda: mode == "verify"))
 
 
-def test_triple_matches_the_formula(plain_stream):
+@pytest.mark.parametrize("mode", ["decode", "verify"])
+def test_triple_matches_the_formula(plain_stream, mode):
+    """On decode steps, and on speculative decoding's verify passes."""
     a, b, c, copy = _Layer(0.5), _Layer(0.7), _Layer(0.9), _Layer(0.8)
     h = torch.tensor([0.1, -0.4, 0.3], dtype=torch.float64)
-    group, fb = [a, b, c], _batch(True)
+    group, fb = [a, b, c], _batch(mode)
     expected = a(h, fb) + (b(h, fb) - h) + (c(copy(h, fb), fb) - copy(h, fb))
     got = replica._member(group, copy, 0, h, fb)
     assert torch.allclose(got, expected.to(got.dtype))
@@ -230,4 +232,4 @@ def test_triple_matches_the_formula(plain_stream):
 def test_prefill_runs_layers_alone(plain_stream):
     a, b = _Layer(0.5), _Layer(0.7)
     h = torch.tensor([0.1, -0.4])
-    assert torch.equal(replica._member([a, b], _Layer(0.8), 1, h, _batch(False)), b(h, None))
+    assert torch.equal(replica._member([a, b], _Layer(0.8), 1, h, _batch("extend")), b(h, None))

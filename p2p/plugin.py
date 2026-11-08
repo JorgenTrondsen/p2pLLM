@@ -1,13 +1,16 @@
 """SGLang hooks and RPC methods, loaded in every scheduler process through the `sglang.srt.plugins` entry point.
 
 Requests with custom_params {"force": [token ids]} are teacher forced. While a reference is being recorded their final
-hidden states are kept; otherwise each decode step scores KL(reference || model) against them.
+hidden states are kept; otherwise each decode step scores KL(reference || model) against them. Under SGLang's NGRAM
+speculative decoding (p2p scan/kl --draft-k), forced requests draft their own solution instead, and every verify pass
+is scored and kept whole, so replicas run on their own state inside each pass, as they would with a real drafter.
 """
 from __future__ import annotations
 
 import json
 import sys
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -17,7 +20,7 @@ class _State:
     logits_call = None         # the last LogitsProcessor call: (original, self, input_ids, hidden states, lm head, batch)
     calibration = None
     sums = {}
-    reference = {}             # {rid: [final hidden state per decoded token]}
+    reference = {}             # {rid: [final hidden state per solution token after the first]}
     recording = False
     kl = agree = tokens = 0
 
@@ -25,35 +28,81 @@ class _State:
 S = _State()
 
 
+def _forced(reqs) -> list:
+    return [(r.sampling_params.custom_params or {}).get("force") for r in reqs]
+
+
 def _logits(original, proc, input_ids, hidden_states, lm_head, metadata, *args, **kwargs):
     S.logits_call = original, proc, input_ids, hidden_states, lm_head, metadata
-    return original(proc, input_ids, hidden_states, lm_head, metadata, *args, **kwargs)
+    out = original(proc, input_ids, hidden_states, lm_head, metadata, *args, **kwargs)
+    if metadata.forward_mode.is_target_verify():
+        _verify(out.next_token_logits, hidden_states)
+    return out
 
 
 def _sample(original, runner, logits_output, fb):
     reqs = S.scheduler.cur_batch_for_debug.reqs if S.scheduler else ()
-    forced = [(r.sampling_params.custom_params or {}).get("force") for r in reqs]
+    forced = _forced(reqs)
     if not any(f is not None for f in forced):
         return original(runner, logits_output, fb)
     if fb.forward_mode.is_decode():
-        _score(reqs, logits_output.next_token_logits)
+        _score([(i, r.rid, len(r.output_ids) - 1) for i, r in enumerate(reqs)], logits_output.next_token_logits)
     ids = original(runner, logits_output, fb)
     ids[:] = torch.as_tensor([f[len(r.output_ids)] for f, r in zip(forced, reqs)], device=ids.device, dtype=ids.dtype)
     return ids
 
 
-def _score(reqs, logits) -> None:
-    logits_fn, proc, input_ids, hidden, lm_head, metadata = S.logits_call
-    if S.recording:
-        for r, h in zip(reqs, hidden):
-            S.reference.setdefault(r.rid, []).append(h.cpu())
+def _drafts(original, worker, batch):
+    """Forced requests draft the next tokens of their solution, as a chain."""
+    drafts, mask = original(worker, batch)
+    forced, n = _forced(batch.reqs), worker.draft_token_num
+    if not any(f is not None for f in forced):
+        return drafts, mask
+    drafts = [(list(r.output_ids[-1:]) + f[len(r.output_ids):] + [0] * n)[:n] for r, f in zip(batch.reqs, forced)]
+    return np.array(drafts, dtype=np.int64).ravel(), np.tile(np.tril(np.ones((n, n), dtype=bool)).ravel(), len(drafts))
+
+
+def _verify(logits, hidden) -> None:
+    """A verify pass of forced requests: score each position whose next token is in the solution, then make that token
+    the model's choice, so the pass keeps all its drafts."""
+    reqs = S.scheduler.cur_batch_for_debug.reqs
+    forced = _forced(reqs)
+    if not any(f is not None for f in forced):
         return
-    lq = F.log_softmax(logits.float(), -1)         # the reference call below may reuse the logits buffer
-    ref = torch.stack([S.reference[r.rid][len(r.output_ids) - 1] for r in reqs]).to(hidden)
-    lp = F.log_softmax(logits_fn(proc, input_ids, ref, lm_head, metadata).next_token_logits.float(), -1)
+    width = len(logits) // len(reqs)
+    rows = [(i * width + j, r.rid, len(r.output_ids) - 1 + j, f[len(r.output_ids) + j])
+            for i, (r, f) in enumerate(zip(reqs, forced)) for j in range(min(width, len(f) - len(r.output_ids)))]
+    if not rows:
+        return
+    _score([x[:3] for x in rows], logits)
+    at = [x[0] for x in rows]
+    logits[at] = 0
+    logits[at, [x[3] for x in rows]] = 1
+
+
+def _score(rows: list, logits) -> None:
+    """rows: (row of the batch, request id, index into its reference) per scored token. While recording, keep the final
+    hidden states; otherwise add up KL(reference || model)."""
+    logits_fn, proc, input_ids, hidden, lm_head, metadata = S.logits_call
+    at = [row for row, _, _ in rows]
+    if S.recording:
+        for row, rid, _ in rows:
+            S.reference.setdefault(rid, []).append(hidden[row].cpu())
+        return
+    lq = F.log_softmax(logits[at].float(), -1)     # a copy: the reference call below may reuse the logits buffer
+    ref = hidden.clone()
+    ref[at] = torch.stack([S.reference[rid][i] for _, rid, i in rows]).to(hidden)
+    lp = F.log_softmax(logits_fn(proc, input_ids, ref, lm_head, metadata).next_token_logits[at].float(), -1)
     S.kl += (lp.exp() * (lp - lq)).sum().item()
     S.agree += (lp.argmax(-1) == lq.argmax(-1)).sum().item()
-    S.tokens += len(reqs)
+    S.tokens += len(rows)
+
+
+def _without_pp(original, worker, batch, *args, pp_proxy_tensors=None, **kwargs):
+    """SGLang 0.5.23 passes pp_proxy_tensors (None without pipeline parallelism) to every drafting worker, but the one for
+    Gemma 4's assistant (FROZEN_KV_MTP) takes no such argument."""
+    assert pp_proxy_tensors is None
+    return original(worker, batch, *args, **kwargs)
 
 
 def _layers(scheduler):
@@ -131,6 +180,9 @@ def install() -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     HookRegistry.register("sglang.srt.model_executor.model_runner.ModelRunner.sample", _sample, HookType.AROUND)
     HookRegistry.register("sglang.srt.layers.logits_processor.LogitsProcessor.forward", _logits, HookType.AROUND)
+    HookRegistry.register("sglang.srt.speculative.frozen_kv_mtp_worker_v2.FrozenKVMTPWorkerV2.forward_batch_generation",
+                          _without_pp, HookType.AROUND)
+    HookRegistry.register("sglang.srt.speculative.ngram_worker.NGRAMWorker._prepare_draft_tokens", _drafts, HookType.AROUND)
     for fn in (p2p_start, p2p_shapes, p2p_calibrate, p2p_load_calibration, p2p_plan, p2p_record, p2p_save_reference,
                p2p_load_reference, p2p_result):
         setattr(Scheduler, fn.__name__, fn)

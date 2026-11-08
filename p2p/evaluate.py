@@ -22,6 +22,8 @@ def _generate(a, rows: list, k: int) -> None:
                 for r, o in zip(chunk, outs):
                     f.write(json.dumps({"id": r["id"], "correct": None if r["gold"] is None else data.correct(o["text"], r["gold"]),
                                         "n_tok": len(solution(o)), "truncated": o["meta_info"]["finish_reason"]["type"] == "length",
+                                        "passes": o["meta_info"].get("spec_verify_ct"),    # speculative decoding only
+                                        "completion_tokens": o["meta_info"]["completion_tokens"],
                                         "ids": solution(o), "text": o["text"]}) + "\n")
             print(f"[{k}] {b + len(chunk)}/{len(rows)}", flush=True)
 
@@ -52,6 +54,9 @@ def report(a) -> int:
         scored = [r for r in rows.values() if r["correct"] is not None]
         line = f"{d}: n {len(rows)}  acc {sum(r['correct'] for r in scored) / max(len(scored), 1):.3f}"
         line += f"  truncated {sum(r['truncated'] for r in rows.values()) / max(len(rows), 1):.3f}"
+        spec = [r for r in rows.values() if r.get("passes")]      # tokens per verify pass, as SGLang counts them
+        if spec:
+            line += f"  tokens per pass {sum(r['completion_tokens'] for r in spec) / sum(r['passes'] for r in spec):.2f}"
         if ref:
             both = [i for i in rows if i in ref and rows[i]["correct"] is not None]
             lost = sum(ref[i]["correct"] and not rows[i]["correct"] for i in both)

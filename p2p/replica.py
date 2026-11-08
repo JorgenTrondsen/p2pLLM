@@ -1,12 +1,14 @@
-"""Run groups of layers in parallel inside SGLang's own forward, on decode steps only.
+"""Run groups of layers in parallel inside SGLang's own forward, on decode steps and speculative decoding's verify passes.
 
 Every member of a group reads the group's input h. The last member's node also holds a shrunk copy of the member before
 it, which gives that member a better input: h~ = copy(h). The next step reads
 
     h' = l_0(h) + sum_{k>0} (l_k(x_k) - x_k),    x_k = h~ for the last member, else h
 
-Prefill stays exact. The copy restarts from the copied layer's state every token, as if that layer's node sends its update
-for each finished token: it runs just before that layer, on the same K/V and state slots, and leaves no trace.
+Prefill stays exact. The copy restarts from the copied layer's state every step, as if that layer's node sends its update
+for each finished token: it runs just before that layer, on the same K/V and state slots, and leaves no trace. A verify
+pass carries several tokens, and the copy keeps its own K/V and state for them, since the copied layer's updates for
+the pass arrive too late.
 """
 from __future__ import annotations
 
@@ -67,7 +69,7 @@ def _member(group: list, replica: nn.Module, k: int, *args, **kw):
     layer = group[k]
     named = _by_name(layer, args, kw)
     fb, h = named["forward_batch"], named["hidden_states"]
-    if not fb.forward_mode.is_decode():
+    if not (fb.forward_mode.is_decode() or fb.forward_mode.is_target_verify()):
         return type(layer).forward(layer, **named)
     if k:                                  # the first member did the work
         return h

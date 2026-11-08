@@ -16,6 +16,9 @@ class Model:
     def __init__(self, path: str, tp: int = 1, batch: int = 32, **engine_args):
         os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "false")  # GPUs may be shared; pools fit the fullest
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # whole plans nearly fill a GPU
+        if engine_args.get("speculative_num_draft_tokens"):   # sliding windows reserve 128 eviction steps per request,
+            os.environ.setdefault("SGLANG_SWA_EVICTION_INTERVAL",   # times the drafted tokens: keep it as without drafting
+                                  str(max(1, 128 // engine_args["speculative_num_draft_tokens"])))
         import sglang as sgl
         from transformers import AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(path)
@@ -71,9 +74,24 @@ def solution(o: dict) -> list:
     return o["output_ids"][:-1] if o["meta_info"]["finish_reason"]["type"] == "stop" else o["output_ids"]
 
 
+def speculative(model: str, draft: str, k: int) -> dict:
+    """SGLang's speculative decoding, drafting a chain of k tokens a pass: with the checkpoint's own MTP layer ("mtp"), a
+    native drafter shipped as its own checkpoint ("mtp:PATH", such as Gemma 4's assistant), or a small model of the same
+    vocabulary (its path). "forced": forced requests draft their own solution (plugin._drafts), for scoring in passes."""
+    if not draft or not k:
+        return {}
+    if draft == "forced":
+        return dict(speculative_algorithm="NGRAM", speculative_num_draft_tokens=k + 1, speculative_ngram_max_bfs_breadth=1)
+    native = draft == "mtp" or draft.startswith("mtp:")
+    return dict(speculative_algorithm="EAGLE" if native else "STANDALONE",
+                speculative_draft_model_path=model if draft == "mtp" else draft.removeprefix("mtp:"),
+                speculative_num_steps=k, speculative_eagle_topk=1, speculative_num_draft_tokens=k + 1)
+
+
 def open_model(a):
     """A model that shuts down on any error: its scheduler processes would otherwise keep the run alive, doing nothing."""
     extra = {"max_total_tokens": a.max_total_tokens} if a.max_total_tokens else {}
+    extra |= speculative(a.model, getattr(a, "draft", ""), getattr(a, "draft_k", 0))
     return contextlib.closing(Model(a.model, tp=a.tp, batch=a.batch, mem_fraction_static=a.mem_fraction, **extra))
 
 

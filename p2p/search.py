@@ -89,31 +89,66 @@ def pick(cost, recipes: dict, bands: list, triples: list, n: int = 3) -> dict:
             "triple": ["uniform", min(names, key=lambda k: ratio(k, triples))] if triples else ["uniform"]}
 
 
-def tilings(L: int, options: dict) -> dict:
-    """{steps: (summed cost, summed size, [(start, n, option)])}: for each step count, the split of layers 0..L-1 into
-    single layers and measured segments with the least summed cost (ties: least size), each segment taking its cheapest
-    option. options: {(start, n): {option: (size, cost)}}."""
-    best = [{} for _ in range(L + 1)]      # best[p][s] = (cost, size, how layer p was reached in s steps)
-    best[0][0] = (0.0, 0.0, None)
-    for p in range(L):
-        for s, (c, z, _) in list(best[p].items()):
+def tilings(L: int, options: dict, k: int = 1) -> dict:
+    """{steps: [(summed cost, summed size, [(start, n, option)])]}: for each step count, the k splits of layers 0..L-1
+    into single layers and measured segments with the least summed cost (ties: least size), best first, each segment
+    taking its cheapest option. options: {(start, n): {option: (size, cost)}}."""
+    best = [{} for _ in range(L + 1)]      # best[p][s] = the k best (cost, size, how layer p was reached in s steps)
+    best[0][0] = [(0.0, 0.0, None)]
+    for p in range(L + 1):
+        for s in best[p]:                  # every way into p is in: keep the k best
+            best[p][s] = sorted(best[p][s], key=lambda w: w[:2])[:k]
+        if p == L:
+            break
+        for s, ways in best[p].items():
             for n in (1, 2, 3):
                 opts = {None: (0.0, 0.0)} if n == 1 else options.get((p, n))
                 if not opts or p + n > L:
                     continue
                 option, (dz, dc) = min(opts.items(), key=lambda kv: (kv[1][1], kv[1][0]))
-                cand = (c + dc, z + dz, (p, s, n, option))
-                if s + 1 not in best[p + n] or cand[:2] < best[p + n][s + 1][:2]:
-                    best[p + n][s + 1] = cand
+                for i, (c, z, _) in enumerate(ways):
+                    best[p + n].setdefault(s + 1, []).append((c + dc, z + dz, (p, s, i, n, option)))
     out = {}
-    for steps, (c, z, back) in best[L].items():
-        segments = []
-        while back is not None:
-            p, s, n, option = back
-            segments.append((p, n, option))
-            back = best[p][s][2]
-        out[steps] = (c, z, segments[::-1])
+    for steps, ways in best[L].items():
+        out[steps] = []
+        for c, z, back in ways:
+            segments = []
+            while back is not None:
+                p, s, i, n, option = back
+                segments.append((p, n, option))
+                back = best[p][s][i][2]
+            out[steps].append((c, z, segments[::-1]))
     return out
+
+
+def refine(cost, shape: dict, cap: float, keep: dict, rounds: int, step: int = 5) -> tuple:
+    """(keep, its cost) after a local search from `keep`, every split within `cap`. Each round tries each projection
+    `step` points lower, then moves budget from the projection whose cut cost least per size to one whose cut cost most,
+    and takes the cheapest of these if it beats the current split. cost(keep): its KL; it is called in a fixed order, so
+    rerunning on the saved measurements repeats the search."""
+    now = cost(keep)
+    for _ in range(rounds):
+        cuts = {p: {**keep, p: keep[p] - step} for p in keep if keep[p] > step}
+        tries = [(cost(c), c) for c in cuts.values()]
+        per_size = {p: (kl - now) / max(size(shape, keep) - size(shape, c), 1e-12) for p, (kl, c) in zip(cuts, tries)}
+        moved = _moved(shape, cap, keep, per_size, step) if per_size else None
+        tries += [(cost(moved), moved)] if moved else []
+        if not tries or min(t[0] for t in tries) >= now:
+            break
+        now, keep = min(tries, key=lambda t: t[0])
+    return keep, now
+
+
+def _moved(shape: dict, cap: float, keep: dict, per_size: dict, step: int) -> "dict | None":
+    """keep with the projection whose cut cost least per size `step` points lower, and the size it frees given to the
+    measured projection with the highest cost per size that can take more; None if none can."""
+    src = min(per_size, key=per_size.get)
+    cut = {**keep, src: keep[src] - step}
+    for dst in sorted((p for p in per_size if p != src), key=lambda p: -per_size[p]):
+        fits = [y for y in range(keep[dst] + 1, 101) if size(shape, {**cut, dst: y}) <= cap]
+        if fits:
+            return {**cut, dst: fits[-1]}
+    return None
 
 
 def plan(model: str, segments: list, keep_of) -> dict:

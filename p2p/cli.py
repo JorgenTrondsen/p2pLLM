@@ -31,11 +31,19 @@ def main(argv=None) -> int:
         s.add_argument("--calib-text", default="", help="a .jsonl or .parquet with a text column")
         s.add_argument("--calib-n", type=int, default=128)
         s.add_argument("--calib-len", type=int, default=2048)
+        s.add_argument("--draft-k", type=int, default=16, help="score in passes of k drafted tokens plus one, as speculative "
+                       "decoding runs them, with replicas on their own state inside a pass (0: one token a step, for plans "
+                       "that run without drafting)")
+        s.set_defaults(draft="forced")
 
     s = sub.add_parser("scan", help="find the least damaging plan for --steps and --replica-size")
     scored(s)
     s.add_argument("--steps", type=int, required=True)
     s.add_argument("--replica-size", type=float, required=True, help="largest replica, as a fraction of a layer")
+    s.add_argument("--candidates", type=int, default=16, help="plans measured whole, best by summed KL first; the lowest "
+                   "is kept (1: the best by sum)")
+    s.add_argument("--refine-rounds", type=int, default=3, help="rounds of searching each group's split freely, from its "
+                   "best menu split (0: the menu only)")
     s.set_defaults(fn=scan)
     s = sub.add_parser("kl", help="KL of one plan against the exact model")
     scored(s)
@@ -47,6 +55,8 @@ def main(argv=None) -> int:
     s.add_argument("--max-new", type=int, default=1024)
     s.add_argument("--n", type=int, default=0, help="only the first n problems")
     s.add_argument("--against", default="", help="another generation directory to pair with")
+    s.add_argument("--draft", default="", help="speculative decoding: mtp, mtp:PATH (a native drafter), or a small model's path")
+    s.add_argument("--draft-k", type=int, default=16, help="tokens drafted per pass")
     s.set_defaults(fn=evaluate)
     s = sub.add_parser("report", help="accuracy of generation directories")
     s.add_argument("dirs", nargs="+")

@@ -33,7 +33,7 @@ def test_the_search_finds_the_scans_plan():
     options = {}
     for start, n, name, size, cost in data["options"]:
         options.setdefault((start, n), {})[name] = (size, cost)
-    cost, _, segments = search.tilings(64, options)[32]
+    cost, _, segments = search.tilings(64, options)[32][0]
     assert data["floor"] + cost == pytest.approx(0.009465, abs=1e-6)
     assert [list(s) for s in segments] == data["segments"]
 
@@ -58,43 +58,52 @@ def test_routed_experts_take_the_cut():
     assert recipes["rest90"]["q"] == 90 and recipes["rest90"]["eup"] < recipes["rest50"]["eup"]
 
 
-def _brute_force(L: int, options: dict) -> dict:
-    """{steps: least summed cost} over every split of L layers into singles, pairs and triples."""
-    best = {}
+def _every_tiling(L: int, options: dict) -> dict:
+    """{steps: [(summed cost, summed size, segments)], best first} over every split of L layers into singles, pairs and
+    triples, each segment taking its cheapest option, as the DP does."""
+    out = {}
     for n in range(1, L + 1):
         for sizes in itertools.product((1, 2, 3), repeat=n):
             if sum(sizes) != L:
                 continue
-            total, p = 0.0, 0
-            for size in sizes:
-                if size > 1:
-                    if (p, size) not in options:
-                        total = math.inf
+            cost = size = 0.0
+            p, segments = 0, []
+            for k in sizes:
+                option = None
+                if k > 1:
+                    if (p, k) not in options:
                         break
-                    total += min(c for _, c in options[p, size].values())
-                p += size
-            best[n] = min(best.get(n, math.inf), total)
-    return {k: v for k, v in best.items() if v < math.inf}
+                    option, (dz, dc) = min(options[p, k].items(), key=lambda kv: (kv[1][1], kv[1][0]))
+                    cost, size = cost + dc, size + dz
+                segments.append((p, k, option))
+                p += k
+            else:
+                out.setdefault(n, []).append((cost, size, segments))
+    return {n: sorted(ways, key=lambda w: w[:2]) for n, ways in out.items()}
 
 
 @pytest.mark.parametrize("seed", range(5))
-def test_the_dp_matches_brute_force(seed):
+@pytest.mark.parametrize("k", [1, 6])
+def test_the_dp_matches_brute_force(seed, k):
     rng = random.Random(seed)
     L = 12
     options = {(p, n): {f"o{j}": (rng.random(), rng.random()) for j in range(2)}
                for n in (2, 3) for p in range(L - n + 1) if rng.random() < 0.7}
-    got = search.tilings(L, options)
-    want = _brute_force(L, options)
+    got = search.tilings(L, options, k)
+    want = _every_tiling(L, options)
     assert set(got) == set(want)
-    for steps, (cost, size, segments) in got.items():
-        assert cost == pytest.approx(want[steps])
-        assert len(segments) == steps and sum(n for _, n, _ in segments) == L
-        assert [p for p, _, _ in segments] == list(itertools.accumulate((n for _, n, _ in segments[:-1]), initial=0))
+    for steps, ways in got.items():
+        assert [c for c, _, _ in ways] == pytest.approx([c for c, _, _ in want[steps][:k]])
+        assert len({tuple(segments) for _, _, segments in ways}) == len(ways)
+        for cost, size, segments in ways:
+            assert (cost, size, segments) in want[steps]
+            assert len(segments) == steps and sum(n for _, n, _ in segments) == L
+            assert [p for p, _, _ in segments] == list(itertools.accumulate((n for _, n, _ in segments[:-1]), initial=0))
 
 
 def test_the_dp_prefers_less_size_on_equal_cost():
     options = {(0, 2): {"big": (0.5, 1.0), "small": (0.2, 1.0)}}
-    assert search.tilings(2, options)[1][2] == [(0, 2, "small")]
+    assert search.tilings(2, options)[1][0][2] == [(0, 2, "small")]
 
 
 @pytest.mark.parametrize("cap,x", [(0.30, 23), (0.35, 28), (0.40, 33), (0.50, 43)])
@@ -157,4 +166,49 @@ def test_plan_names_the_copied_layer():
 
 def test_a_tiling_with_no_measured_segments_is_all_single_layers():
     t = search.tilings(4, {})
-    assert list(t) == [4] and t[4][2] == [(i, 1, None) for i in range(4)] and not math.isnan(t[4][0])
+    assert list(t) == [4] and t[4][0][2] == [(i, 1, None) for i in range(4)] and not math.isnan(t[4][0][0])
+
+
+SHIFT = {"q": 16, "k": 7, "v": 7, "z": 33, "out": 55, "gate": 36, "up": 36, "down": 36}
+
+
+def _convex(weights: dict):
+    """A cost that falls as projections keep more, faster for heavier ones; it records every split it is asked about."""
+    calls = []
+
+    def cost(keep):
+        calls.append(dict(keep))
+        return sum(w / keep[p] for p, w in weights.items())
+    return cost, calls
+
+
+def test_refine_lowers_the_cost_within_the_cap():
+    cost, calls = _convex({"q": 1, "k": 0, "v": 0, "z": 1, "out": 2, "gate": 6, "up": 6, "down": 9})
+    keep, kl = search.refine(cost, LINEAR, 0.40, SHIFT, rounds=100)
+    assert kl < cost(SHIFT) and kl == pytest.approx(cost(keep))
+    assert all(search.size(LINEAR, c) <= 0.40 + 1e-9 and 1 <= min(c.values()) and max(c.values()) <= 100 for c in calls)
+    assert keep["k"] <= 5 and keep["v"] <= 5 and keep["down"] > SHIFT["down"]     # worthless k, v gave their budget away
+    assert search.refine(cost, LINEAR, 0.40, keep, rounds=1)[0] == keep           # it stopped where no move helps
+
+
+def test_refine_replays_on_saved_costs():
+    cost, calls = _convex({"q": 3, "k": 1, "v": 1, "z": 2, "out": 2, "gate": 4, "up": 4, "down": 5})
+    first = search.refine(cost, LINEAR, 0.40, SHIFT, rounds=3)
+    saved = {json.dumps(c, sort_keys=True): cost(c) for c in list(calls)}
+    replay = search.refine(lambda c: saved[json.dumps(c, sort_keys=True)], LINEAR, 0.40, SHIFT, rounds=3)
+    assert replay == first
+
+
+def test_refine_without_rounds_keeps_the_start():
+    cost, calls = _convex({"q": 1})
+    assert search.refine(cost, LINEAR, 0.40, SHIFT, rounds=0) == (SHIFT, cost(SHIFT)) and len(calls) == 2
+
+
+def test_a_move_gives_the_cheapest_cut_to_the_dearest_projection():
+    per_size = {"k": -0.5, "q": 0.1, "down": 3.0, "out": 2.0}
+    moved = search._moved(LINEAR, 0.40, SHIFT, per_size, 5)
+    assert moved["k"] == SHIFT["k"] - 5 and moved["down"] > SHIFT["down"]
+    assert {p: v for p, v in moved.items() if p not in ("k", "down")} == {p: v for p, v in SHIFT.items() if p not in ("k", "down")}
+    assert search.size(LINEAR, moved) <= 0.40
+    assert search._moved(LINEAR, 0.40, SHIFT, {"k": 0.0}, 5) is None          # no other projection was measured
+    assert search._moved(LINEAR, 0.40, {**SHIFT, "down": 100}, {"k": 0.0, "down": 1.0}, 5) is None   # none can grow
