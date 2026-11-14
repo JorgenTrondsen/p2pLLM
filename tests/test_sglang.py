@@ -27,25 +27,25 @@ SEEN = {}                    # hidden states per (kind, tp), to compare TP sizes
 tags = itertools.count()
 
 
-def _checkpoint(kind: str) -> str:
-    """A tiny checkpoint of a family, saved once. Heads of 64: FlashInfer has no kernel for 32."""
-    path = f"{ROOT}/{kind}"
+def _checkpoint(kind: str, layers: int = 8) -> str:
+    """A tiny checkpoint of a family, saved once. Heads of 64: FlashInfer has no kernel for 32. layers: a multiple of 4."""
+    path = f"{ROOT}/{kind}" + (f"_{layers}layers" if layers != 8 else "")
     if os.path.exists(f"{path}/config.json"):
         return path
     from transformers import (AutoTokenizer, Gemma4Config, Gemma4ForConditionalGeneration, Qwen3Config, Qwen3ForCausalLM,
                               Qwen3_5Config, Qwen3_5ForConditionalGeneration, Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration)
-    text = dict(vocab_size=248320, hidden_size=256, intermediate_size=512, num_hidden_layers=8, num_attention_heads=4,
+    text = dict(vocab_size=248320, hidden_size=256, intermediate_size=512, num_hidden_layers=layers, num_attention_heads=4,
                 num_key_value_heads=2, head_dim=64, initializer_range=0.1, max_position_embeddings=4096)
     if kind == "qwen3":
         model = Qwen3ForCausalLM(Qwen3Config(**text, rope_parameters={"rope_type": "default", "rope_theta": 10000.0}))
     elif kind == "gemma4":       # the real model's head sizes, wider on full attention, and its k = v
-        layer_types = (["sliding_attention"] * 3 + ["full_attention"]) * 2
+        layer_types = (["sliding_attention"] * 3 + ["full_attention"]) * (layers // 4)
         model = Gemma4ForConditionalGeneration(Gemma4Config(text_config={
             **text, "layer_types": layer_types, "head_dim": 256, "global_head_dim": 512, "num_global_key_value_heads": 2,
             "sliding_window": 1024, "attention_k_eq_v": True, "final_logit_softcapping": 30.0, "hidden_size_per_layer_input": 0},
             vision_config={"num_hidden_layers": 1}))
     else:
-        layer_types = (["linear_attention"] * 3 + ["full_attention"]) * 2
+        layer_types = (["linear_attention"] * 3 + ["full_attention"]) * (layers // 4)
         rope = {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25, "mrope_interleaved": True,
                 "mrope_section": [3, 3, 2]}
         vision = dict(depth=12, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=256)
@@ -94,7 +94,11 @@ def e(request, tmp_path_factory):
     tmp = str(tmp_path_factory.mktemp(f"{kind}_{tp}"))
     m.calibrate([[token() for _ in range(64)] for _ in range(8)], f"{tmp}/calib.pt")
     m.rpc("p2p_load_calibration", path=f"{tmp}/calib.pt")
-    env = SimpleNamespace(m=m, kind=kind, tp=tp, items=items, tmp=tmp, tol=2 * TOL if kind == "qwen3_5_moe" else TOL)  # MoE sums more terms
+    # A group's sum is not the layers in sequence to the last bit: each part is rounded to the model's dtype, as a node
+    # sends it (replica.py). These random models amplify that (runs/review/tiny_err.py: up to 0.3% on Qwen3 and Qwen3.5,
+    # 0.5% on the MoE, which sums more terms, 1.2% on Gemma's first pair), while a fault is another order: a copy pruned
+    # to 5% is 100% off. On real weights it costs nothing (Gemma 4 31B's plan: KL .01880 against .01881 unrounded).
+    env = SimpleNamespace(m=m, kind=kind, tp=tp, items=items, tmp=tmp, tol={"qwen3_5_moe": 2 * TOL, "gemma4": 4 * TOL}.get(kind, TOL))
     env.exact = _hidden(env, None)
     yield env
     m.close()
@@ -121,7 +125,8 @@ def test_no_groups_matches_stock(e):
 
 @pytest.mark.parametrize("groups", PAIRS, ids=str)
 def test_full_copy_matches_sequential(e, groups):
-    """h' = l0(h) + l1(copy(h)) - copy(h) = l1(l0(h)), which needs the plain runs, state restore and K/V overwrite all right."""
+    """h' = l0(h) + l1(copy(h)) - copy(h) = l1(l0(h)) up to rounding (e.tol), which needs the plain runs, state restore
+    and K/V overwrite all right."""
     assert _err(_hidden(e, _plan(groups)), e.exact) < e.tol
 
 

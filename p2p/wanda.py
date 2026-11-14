@@ -73,12 +73,15 @@ def channel_norms(sums: torch.Tensor, w: torch.Tensor, group=None) -> torch.Tens
     return norms
 
 
-def prune(w: torch.Tensor, keep: float, norms: torch.Tensor, group=None) -> torch.Tensor:
-    """w with zeros everywhere but the `keep` percent of each row's weights that score highest. A projection split across
-    ranks compares scores across them, so the choice doesn't depend on the TP size."""
+def prune(w: torch.Tensor, keep: float, norms: torch.Tensor, group=None, with_mask: bool = False):
+    """w with zeros everywhere but the `keep` percent of each row's weights that score highest (and, with_mask, which
+    those are: the same number in every row). A projection split across ranks compares scores across them, so the choice
+    doesn't depend on the TP size."""
     score = w.float().abs() * norms
     full = group.all_gather(score, dim=score.dim() - 1) if group else score
     k = max(1, round(keep / 100 * full.shape[-1]))
     mask = torch.zeros_like(full, dtype=torch.bool).scatter_(-1, full.topk(k, dim=-1).indices, True)
     start = group.rank_in_group * w.shape[-1] if group else 0
-    return (w.float() * mask[..., start: start + w.shape[-1]]).to(w.dtype)
+    mask = mask[..., start: start + w.shape[-1]]
+    pruned = (w.float() * mask).to(w.dtype)
+    return (pruned, mask) if with_mask else pruned

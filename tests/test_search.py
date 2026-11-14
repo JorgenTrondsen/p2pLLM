@@ -14,7 +14,7 @@ MLP = {"gate": [17408, 5120], "up": [17408, 5120], "down": [5120, 17408]}
 LINEAR = {"q": [2048, 5120], "k": [2048, 5120], "v": [6144, 5120], "z": [6144, 5120], "out": [5120, 6144], **MLP}
 ATTENTION = {"q": [12288, 5120], "k": [1024, 5120], "v": [1024, 5120], "o": [5120, 6144], **MLP}
 TYPES = ["A" if i % 4 == 3 else "L" for i in range(64)]
-W40 = json.load(open(os.path.join(HERE, "..", "configs", "qwen3.8_w40.json")))
+W40 = json.load(open(os.path.join(HERE, "data", "qwen3.8_w40.json")))     # the draft's plan for Qwen3.8 at .40
 COSTS = os.path.join(HERE, "data", "q38_s32_costs.json")    # measured by the scan at 32 steps, replica size .40
 
 

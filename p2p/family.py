@@ -27,9 +27,11 @@ class Projection(NamedTuple):
 
 
 def layers(model: nn.Module) -> nn.ModuleList:
-    """The decoder layers: the longest module list of layers with the MLP in TABLE (a vision tower can be longer)."""
-    found = [m for m in model.modules() if isinstance(m, nn.ModuleList) and len(m)
-             and {"gate_up_proj", "down_proj"} <= {path.rsplit(".", 1)[-1] for path, _ in m[0].named_modules()}]
+    """The decoder layers: the longest module list of layers with the MLP in TABLE (a vision tower can be longer). Under
+    pipeline parallelism the layers a rank doesn't hold are placeholders."""
+    held = lambda m: next((x for x in m if type(x).__name__ != "PPMissingLayer"), None)
+    found = [m for m in model.modules() if isinstance(m, nn.ModuleList) and held(m) is not None
+             and {"gate_up_proj", "down_proj"} <= {path.rsplit(".", 1)[-1] for path, _ in held(m).named_modules()}]
     if not found:
         raise ValueError(f"{type(model).__name__}: add its attention and MLP projections to p2p.family.TABLE")
     return max(found, key=len)
@@ -88,18 +90,20 @@ def split_group(module: nn.Module, p: Projection):
 
 
 @contextlib.contextmanager
-def restored_state(layer: nn.Module):
-    """Undo what running a copy does to a linear-attention layer's conv and recurrent state at this batch's slots.
-    Attention layers need nothing: the real layer overwrites the copy's K/V for the current token."""
-    if not hasattr(layer, "linear_attn"):
+def restored_state(*layers: nn.Module):
+    """Undo what running a copy, or a verify pass more than once (p2p.stream: SGLang's tree convolution moves the conv
+    state on), does to linear-attention layers' conv and recurrent state at this batch's slots. Attention layers need
+    nothing: the real layer overwrites the copy's K/V for the current token."""
+    linear = [layer for layer in layers if hasattr(layer, "linear_attn")]
+    if not linear:
         yield
         return
     from sglang.srt.model_executor.forward_context import get_attn_backend
     backend = get_attn_backend()
     backend = getattr(backend, "linear_attn_backend", backend)
     slots = backend.forward_metadata.mamba_cache_indices.long()
-    state = backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-    saved = [(t, t[slots].clone()) for t in (*state.conv, state.temporal)]
+    states = [backend.req_to_token_pool.mamba2_layer_cache(layer.layer_id) for layer in linear]
+    saved = [(t, t[slots].clone()) for state in states for t in (*state.conv, state.temporal)]
     yield
     for t, values in saved:
         t[slots] = values

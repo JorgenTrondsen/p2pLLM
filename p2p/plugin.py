@@ -8,6 +8,7 @@ is scored and kept whole, so replicas run on their own state inside each pass, a
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import numpy as np
@@ -23,6 +24,8 @@ class _State:
     reference = {}             # {rid: [final hidden state per solution token after the first]}
     recording = False
     kl = agree = tokens = 0
+    tree_scores = None        # P2P_TREES: the scores of the last tree the drafter organized
+    tree_pool = None          # P2P_TREES: every candidate the drafter considered for it
 
 
 S = _State()
@@ -35,8 +38,8 @@ def _forced(reqs) -> list:
 def _logits(original, proc, input_ids, hidden_states, lm_head, metadata, *args, **kwargs):
     S.logits_call = original, proc, input_ids, hidden_states, lm_head, metadata
     out = original(proc, input_ids, hidden_states, lm_head, metadata, *args, **kwargs)
-    if metadata.forward_mode.is_target_verify():
-        _verify(out.next_token_logits, hidden_states)
+    if metadata.forward_mode.is_target_verify() and getattr(S.scheduler, "cur_batch_for_debug", None) is not None:
+        _verify(out.next_token_logits, hidden_states)       # not SGLang's CUDA graph warm-ups and captures: no batch
     return out
 
 
@@ -98,6 +101,34 @@ def _score(rows: list, logits) -> None:
     S.tokens += len(rows)
 
 
+def _scores(original, score_list, token_list, parents_list, num_draft_token):
+    """P2P_TREES: the drafter's score (the product of its probabilities along the path) of each node a pass verifies, and
+    every candidate its beam search considered: their tokens, scores, and SGLang's parent list (candidate j's parent is
+    candidate parents[j // topk], -1 the root)."""
+    out = original(score_list, token_list, parents_list, num_draft_token)
+    scores = torch.cat(score_list, dim=1).flatten(1)
+    S.tree_scores = scores.gather(1, out[1])
+    S.tree_pool = scores, torch.cat(token_list, dim=1), out[0]
+    return out
+
+
+def _tree(original, bonus_tokens, parent_list, top_scores_index, draft_tokens, seq_lens, *args, **kwargs):
+    """P2P_TREES: each pass's tree, as SGLang lays it out to verify, a line per request to <dir>/trees_<pid>.jsonl: its
+    tokens (the root first), each node's first child and next sibling (-1: none), the scores of all but the root, and the
+    request's length without them (bench/pp/trees.py); and the pool of candidates it was chosen from (_scores)."""
+    out = original(bonus_tokens, parent_list, top_scores_index, draft_tokens, seq_lens, *args, **kwargs)
+    tokens, nxt, sib = out[5], out[3], out[4]
+    n = tokens.numel() // seq_lens.numel()
+    with open(os.path.join(os.environ["P2P_TREES"], f"trees_{os.getpid()}.jsonl"), "a") as f:
+        for i, length in enumerate(seq_lens.tolist()):
+            f.write(json.dumps({"length": length, "tokens": tokens[i * n:(i + 1) * n].tolist(),
+                                "next": nxt.view(-1, n)[i].tolist(), "sibling": sib.view(-1, n)[i].tolist(),
+                                "scores": S.tree_scores[i].float().tolist(),
+                                "pool": {"scores": S.tree_pool[0][i].float().tolist(), "tokens": S.tree_pool[1][i].tolist(),
+                                         "parents": S.tree_pool[2][i].tolist()}}) + "\n")
+    return out
+
+
 def _without_pp(original, worker, batch, *args, pp_proxy_tensors=None, **kwargs):
     """SGLang 0.5.23 passes pp_proxy_tensors (None without pipeline parallelism) to every drafting worker, but the one for
     Gemma 4's assistant (FROZEN_KV_MTP) takes no such argument."""
@@ -111,11 +142,21 @@ def _layers(scheduler):
 
 
 def _on_rank0(scheduler) -> bool:
-    return scheduler.tp_group.rank_in_group == 0
+    """The rank that writes results: the first of the TP group that holds the logits (the last pipeline stage)."""
+    return scheduler.tp_group.rank_in_group == 0 and scheduler.pp_group.is_last_rank
+
+
+def _save(obj, path: str) -> None:
+    """Write whole, then rename: under pipeline parallelism an RPC returns before the last stage has run it."""
+    torch.save(obj, path + ".part")
+    os.replace(path + ".part", path)
 
 
 def p2p_start(self) -> None:
+    from p2p import route
     S.scheduler = self
+    if route.S.ranks is not None:            # spread ranks hold layers they must not run exact, with or without a plan
+        route.install_plan(self, _layers(self), None, {})
 
 
 def p2p_shapes(self, path: str) -> None:
@@ -130,25 +171,34 @@ def p2p_shapes(self, path: str) -> None:
 def p2p_calibrate(self, path: str = "") -> None:
     """Start collecting calibration sums, or stop and save them to path (and use them)."""
     from p2p import wanda
+    assert self.pp_group.world_size == 1, "calibrate on one pipeline stage: each holds only some layers"
     if not path:
         S.calibration = wanda.Calibration(_layers(self))
         return
     S.sums = S.calibration.finish(_layers(self))
     S.calibration = None
     if _on_rank0(self):
-        torch.save(S.sums, path)
+        _save(S.sums, path)
 
 
 def p2p_load_calibration(self, path: str) -> None:
     S.sums = torch.load(path)
 
 
+def p2p_prepare(self, plan: dict, layers: list, out: str) -> None:
+    """Write these layers' replicas under plan, pruned from the weights this engine loaded (p2p.prepare)."""
+    from p2p import prepare
+    prepare.write(_layers(self), plan, S.sums, layers, out)
+
+
 def p2p_plan(self, plan: "dict | None" = None) -> None:
     """Install a plan, or the exact model without one."""
-    from p2p import replica
+    from p2p import replica, route
     replica.remove(_layers(self))
     torch.cuda.empty_cache()
-    if plan:
+    if route.S.ranks is not None:
+        route.install_plan(self, _layers(self), plan, S.sums)
+    elif plan:
         replica.install(_layers(self), plan, S.sums)
 
 
@@ -159,7 +209,7 @@ def p2p_record(self, on: bool) -> None:
 
 def p2p_save_reference(self, path: str) -> None:
     if _on_rank0(self):
-        torch.save({k: torch.stack(v) for k, v in S.reference.items()}, path)
+        _save({k: torch.stack(v) for k, v in S.reference.items()}, path)
 
 
 def p2p_load_reference(self, path: str) -> None:
@@ -174,6 +224,9 @@ def p2p_result(self, path: str) -> None:
 
 
 def install() -> None:
+    from p2p import pp, route
+    pp.install_launcher()                   # in the process that launches the schedulers: their GPUs, their sockets
+    route.install_launcher()
     if "sglang.srt.managers.scheduler" not in sys.modules:         # this process doesn't run the model
         return
     from sglang.srt.managers.scheduler import Scheduler
@@ -183,6 +236,14 @@ def install() -> None:
     HookRegistry.register("sglang.srt.speculative.frozen_kv_mtp_worker_v2.FrozenKVMTPWorkerV2.forward_batch_generation",
                           _without_pp, HookType.AROUND)
     HookRegistry.register("sglang.srt.speculative.ngram_worker.NGRAMWorker._prepare_draft_tokens", _drafts, HookType.AROUND)
-    for fn in (p2p_start, p2p_shapes, p2p_calibrate, p2p_load_calibration, p2p_plan, p2p_record, p2p_save_reference,
-               p2p_load_reference, p2p_result):
+    if os.environ.get("P2P_TREES"):
+        HookRegistry.register("sglang.srt.speculative.eagle_utils.organize_draft_results", _scores, HookType.AROUND)
+        HookRegistry.register("sglang.srt.speculative.eagle_utils.build_tree_kernel_efficient", _tree, HookType.AROUND)
+    for fn in (p2p_start, p2p_shapes, p2p_calibrate, p2p_load_calibration, p2p_prepare, p2p_plan, p2p_record,
+               p2p_save_reference, p2p_load_reference, p2p_result):
         setattr(Scheduler, fn.__name__, fn)
+    from p2p import pp, prepare, route, stream
+    Scheduler.p2p_stream_check = stream.p2p_stream_check
+    pp.install()
+    route.install()
+    prepare.install()

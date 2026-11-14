@@ -1,9 +1,11 @@
-"""p2p scan | kl | eval | report: find a plan for given steps and replica size, and check it."""
+"""p2p scan | kl | eval | report | replicas: find a plan for given steps and replica size, check it, and prepare its
+replicas for deployment."""
 from __future__ import annotations
 
 import argparse
 
 from p2p.evaluate import evaluate, report
+from p2p.prepare import replicas
 from p2p.scan import kl, scan
 
 
@@ -56,8 +58,22 @@ def main(argv=None) -> int:
     s.add_argument("--n", type=int, default=0, help="only the first n problems")
     s.add_argument("--against", default="", help="another generation directory to pair with")
     s.add_argument("--draft", default="", help="speculative decoding: mtp, mtp:PATH (a native drafter), or a small model's path")
-    s.add_argument("--draft-k", type=int, default=16, help="tokens drafted per pass")
+    s.add_argument("--draft-k", type=int, default=16, help="tokens drafted per pass (a tree's depth)")
+    s.add_argument("--draft-topk", type=int, default=1, help="candidates kept per draft step: above 1, a tree")
+    s.add_argument("--draft-tokens", type=int, default=0, help="tokens a tree's pass verifies, root included "
+                   "(default: a chain's k + 1)")
     s.set_defaults(fn=evaluate)
+    s = sub.add_parser("replicas", help="prune a plan's replicas ahead of time, as a peer node does before deployment")
+    s.add_argument("--model", required=True)
+    s.add_argument("--plan", required=True)
+    s.add_argument("--calib", required=True, help="the scan's calibration sums")
+    s.add_argument("--out", required=True)
+    s.add_argument("--layers", default="", type=lambda x: [int(i) for i in x.split(",")] if x else [],
+                   help="only these copied layers (default: every replica of the plan); SGLang loads every layer from "
+                        "the first to the last of them, on one GPU")
+    s.add_argument("--dtype", default="auto", help="as the deployment loads the model")
+    s.add_argument("--mem-fraction", type=float, default=0.85)
+    s.set_defaults(fn=replicas)
     s = sub.add_parser("report", help="accuracy of generation directories")
     s.add_argument("dirs", nargs="+")
     s.add_argument("--against", default="")

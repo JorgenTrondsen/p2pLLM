@@ -14,6 +14,7 @@ from test_sglang import PAIRS, ROOT, _checkpoint, _plan
 from p2p.engine import Model, speculative
 
 K = 3
+TIE = 0.02                   # log-probability: a few float16 steps of these models' logits
 
 
 def _with_mtp() -> str:
@@ -43,17 +44,21 @@ def e(request, tmp_path_factory):
     m.calibrate([[token() for _ in range(64)] for _ in range(8)], calib)
     m.rpc("p2p_load_calibration", path=calib)
     env = SimpleNamespace(m=m, prompts=[[token() for _ in range(8 + 5 * i)] for i in range(4)])
-    env.exact = _run(env, None)
+    env.exact = _run(env, None, margins=True)
     yield env
     m.close()
 
 
-def _run(e, plan) -> SimpleNamespace:
-    """Greedy tokens under a plan, and tokens per verify pass (spec_verify_ct is missing without speculative decoding)."""
+def _run(e, plan, margins: bool = False) -> SimpleNamespace:
+    """Greedy tokens under a plan, and tokens per verify pass (spec_verify_ct is missing without speculative decoding);
+    margins: also how far apart the two best tokens are at each position, as log-probabilities."""
     e.m.rpc("p2p_plan", plan=plan)
-    outs = e.m.generate(e.prompts, 16)
+    outs = e.m.engine.generate(input_ids=e.prompts, sampling_params={"temperature": 0, "max_new_tokens": 16},
+                               **({"return_logprob": True, "top_logprobs_num": 2} if margins else {}))
     per_pass = sum(o["meta_info"]["completion_tokens"] for o in outs) / sum(o["meta_info"]["spec_verify_ct"] for o in outs)
-    return SimpleNamespace(ids=[o["output_ids"] for o in outs], per_pass=per_pass)
+    return SimpleNamespace(ids=[o["output_ids"] for o in outs], per_pass=per_pass,
+                           margins=[[best[0] - second[0] for best, second in o["meta_info"]["output_top_logprobs"]]
+                                    for o in outs] if margins else None)
 
 
 def test_drafter_arguments():
@@ -63,6 +68,8 @@ def test_drafter_arguments():
         args = speculative("m", draft, 3)
         assert (args["speculative_algorithm"], args["speculative_draft_model_path"]) == (algorithm, path)
         assert args["speculative_num_draft_tokens"] == 4
+    tree = speculative("m", "mtp", 3, topk=4, tokens=8)
+    assert (tree["speculative_eagle_topk"], tree["speculative_num_draft_tokens"]) == (4, 8)
 
 
 def test_decoding_is_speculative(e):
@@ -72,8 +79,15 @@ def test_decoding_is_speculative(e):
 
 @pytest.mark.parametrize("groups", PAIRS, ids=str)
 def test_full_copy_matches_exact(e, groups):
-    """A pass of several tokens needs the copy's K/V overwrite and state restore right, as a decode step does."""
-    assert _run(e, _plan(groups)).ids == e.exact.ids
+    """A pass of several tokens needs the copy's K/V overwrite and state restore right, as a decode step does. A group's
+    sum is the layers in sequence only up to the last bit (replica.py rounds each part as a node sends it), so a full
+    copy's greedy tokens may part from the exact model's, but only where that model's two best tokens are tied."""
+    for i, (ids, exact) in enumerate(zip(_run(e, _plan(groups)).ids, e.exact.ids)):
+        at = next((j for j, (a, b) in enumerate(zip(ids, exact)) if a != b), None)
+        if at is None:
+            assert len(ids) == len(exact)
+        else:
+            assert e.exact.margins[i][at] < TIE, f"request {i} parts at token {at}, where the exact model is sure"
 
 
 def test_pruned_copy_runs_in_verify_passes(e):
